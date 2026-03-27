@@ -24,11 +24,12 @@ def _codec(pt,flow):
 # ---------- emit ----------
 def _emit_rtp(info,size,frag,codec):
     _on_rtp({'pts':info['ts'],'size':size,'frag':frag,
-             'codec':codec,'flow':info['flow'],'channel':info['channel']})
+             'codec':codec,'flow':info['flow'],'channel':info['channel'],
+             'src_ip':info.get('src_ip')})
 def _emit_frame(d,info,codec,nalu=None,is_video=True):
     _on_frame({'pts':info['ts'],'codec':codec,'is_video':is_video,
                'nalu_type':nalu,'data':d,'flow':info['flow'],
-               'channel':info['channel']})
+               'channel':info['channel'],'src_ip':info.get('src_ip')})
 
 # ---------- H26x ----------
 _frag_h26x={}
@@ -92,15 +93,13 @@ def _h263(rtp,payload,info):
 _ssrc_guard={}
 
 # ---------- 入口 ----------
-def process(rtp_bytes: bytes, flow, channel):
+def process(rtp_bytes: bytes, flow, channel, src_ip: str | None = None):
     if len(rtp_bytes)<12:
-        print("not enough len!!")
         return
         #callbacks.invalidate_flow(flow,'RTP<12'); return
     try: 
         rtp=_hdr(rtp_bytes)
         if rtp['ssrc']==0 and rtp['pt']==0:
-            print("heart package\n")
             return 
     except Exception as e:
         callbacks.invalidate_flow(flow,f'hdr {e}'); return
@@ -112,7 +111,7 @@ def process(rtp_bytes: bytes, flow, channel):
         _ssrc_guard[keyg]=rtp['ssrc']
     elif ss!=rtp['ssrc']:
         callbacks.invalidate_flow(flow,'SSRC jump'); return
-    rtp.update({'flow':flow,'channel':channel})
+    rtp.update({'flow':flow,'channel':channel,'src_ip':src_ip})
     payload=rtp_bytes[rtp['hdr_len']:]
     if codec in ('H264','H265'): _h26x(rtp,payload,rtp,codec)
     elif codec=='H263':          _h263(rtp,payload,rtp)

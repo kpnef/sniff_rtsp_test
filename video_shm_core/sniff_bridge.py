@@ -25,7 +25,7 @@ class SniffToSharedMemoryBridge:
         frame_width: int = 1920,
         frame_height: int = 1080,
         pix_fmt: str = 'nv12',
-        reset_existing: bool = False,
+        reset_existing: bool = True,
     ) -> None:
         self.config = SharedVideoConfig(
             base_name=base_name,
@@ -35,7 +35,9 @@ class SniffToSharedMemoryBridge:
             frame_height=frame_height,
             pix_fmt=pix_fmt,
         )
-        self.ring = SharedVideoRingBuffer.create_or_attach(self.config, reset_existing=reset_existing)
+        # Each producer startup must start from a clean shared-memory state
+        # so stale frames/channels from previous runs do not contaminate the new session.
+        self.ring = SharedVideoRingBuffer.create(self.config, reset_existing=True)
         self._lock = threading.RLock()
         self._writers: Dict[str, _BridgeItem] = {}
 

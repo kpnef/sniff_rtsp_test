@@ -2,13 +2,13 @@
 from __future__ import annotations
 import time, re, threading, struct, urllib.parse
 from dataclasses import dataclass, field
-from typing import Dict, Tuple, Literal, Optional
+from typing import Dict, Tuple, Literal, Optional, Iterable
 from scapy.layers.inet import IP, TCP, UDP
 from scapy.packet import Raw, Packet
 import traceback 
 
 # ─── 对外覆写钩子 ─────────────────────────────────────────────
-def rtp_callback(rtp_bytes: bytes, flow: 'FlowEntry', channel: int | None):
+def rtp_callback(rtp_bytes: bytes, flow: 'FlowEntry', channel: int | None, src_ip: str | None = None):
     pass
 
 # ─── 基本类型 ─────────────────────────────────────────────────
@@ -38,6 +38,13 @@ FLOW_TTL, IDLE_TTL, PLAY_TTL = 60, 30, 300
 _ft : Dict[Key, FlowEntry]   = {}
 _rst: Dict[str, RtspSession] = {}
 _lock = threading.RLock()
+_local_ipv4_set: set[str] = set()
+
+
+def set_local_ipv4s(ips: Iterable[str]) -> None:
+    global _local_ipv4_set
+    _local_ipv4_set = {str(ip) for ip in ips if ip}
+
 
 # ─── 正则 ────────────────────────────────────────────────────
 RTSP_MIN_RE  = re.compile(rb'RTSP/\d\.\d.*?CSeq:', re.S)
@@ -172,7 +179,7 @@ def _tcp_consume(fe:FlowEntry):
             if len(buf)<4: print("len<4");break
             plen=struct.unpack('!H',buf[2:4])[0]
             if len(buf)<4+plen: print("wait next tcp");break
-            rtp_callback(buf[4:4+plen],fe,buf[1])
+            rtp_callback(buf[4:4+plen],fe,buf[1], None)
             del buf[:4+plen]
             if len(buf)<4:
                 continue
@@ -210,9 +217,14 @@ def _handle_udp(pkt):
         fe=lookup_ft(key)
         if fe and fe.tag=='UDP-RTP':
             fe.last_ts=time.time()
-            rtp_callback(bytes(pkt[Raw]),fe,None)
+            src_ip = pkt[IP].src if pkt.haslayer(IP) else None
+            rtp_callback(bytes(pkt[Raw]),fe,None,src_ip)
 
 def dispatch(pkt:Packet):
+    if not pkt.haslayer(IP):
+        return
+    if _local_ipv4_set and pkt[IP].dst in _local_ipv4_set:
+        return
     if pkt.haslayer(TCP): _handle_tcp(pkt)
     elif pkt.haslayer(UDP): _handle_udp(pkt)
 

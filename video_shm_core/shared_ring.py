@@ -4,6 +4,7 @@ import contextlib
 import fcntl
 import os
 import struct
+from multiprocessing import resource_tracker
 from dataclasses import dataclass
 from multiprocessing import shared_memory
 from pathlib import Path
@@ -30,6 +31,20 @@ CHANNEL_SIZE = _CHANNEL_STRUCT.size
 BLOCK_SIZE_META = _BLOCK_STRUCT.size
 LOCK_DIR = Path('/tmp/sniff_video_shm_locks')
 LOCK_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _unregister_persistent_shared_memory(shm: shared_memory.SharedMemory) -> None:
+    try:
+        resource_tracker.unregister(shm._name, 'shared_memory')
+    except Exception:
+        pass
+
+
+def _reregister_shared_memory(shm: shared_memory.SharedMemory) -> None:
+    try:
+        resource_tracker.register(shm._name, 'shared_memory')
+    except Exception:
+        pass
 
 
 @dataclass
@@ -201,6 +216,8 @@ class SharedVideoRingBuffer:
                     shm.unlink()
         meta_shm = shared_memory.SharedMemory(name=meta_name, create=True, size=meta_size)
         data_shm = shared_memory.SharedMemory(name=data_name, create=True, size=data_size)
+        _unregister_persistent_shared_memory(meta_shm)
+        _unregister_persistent_shared_memory(data_shm)
         ring = cls(config=config, meta_shm=meta_shm, data_shm=data_shm, owner=True, validate_header=False)
         ring._init_memory()
         return ring
@@ -219,6 +236,8 @@ class SharedVideoRingBuffer:
     def attach(cls, base_name: str) -> 'SharedVideoRingBuffer':
         meta_shm = shared_memory.SharedMemory(name=f'{base_name}_meta', create=False)
         data_shm = shared_memory.SharedMemory(name=f'{base_name}_data', create=False)
+        _unregister_persistent_shared_memory(meta_shm)
+        _unregister_persistent_shared_memory(data_shm)
         config = cls._read_config(meta_shm.buf, base_name=base_name)
         return cls(config=config, meta_shm=meta_shm, data_shm=data_shm, owner=False)
 
@@ -290,6 +309,8 @@ class SharedVideoRingBuffer:
         self._meta_shm.close()
         self._data_shm.close()
         if unlink and self._owner:
+            _reregister_shared_memory(self._meta_shm)
+            _reregister_shared_memory(self._data_shm)
             with contextlib.suppress(FileNotFoundError):
                 self._meta_shm.unlink()
             with contextlib.suppress(FileNotFoundError):

@@ -8,7 +8,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+import cv2
 import ffmpeg
+import numpy as np
 
 from .shared_ring import SharedVideoRingBuffer
 
@@ -21,23 +23,40 @@ class DecodeStats:
     last_pts: int = -1
 
 
-class _FfmpegDecodeWorker:
-    def __init__(
-        self,
-        process,
-        ring: SharedVideoRingBuffer,
-        channel_id: int,
-        source_id: str,
-        *,
-        frame_width: int,
-        frame_height: int,
-        pix_fmt: str,
-        synthetic_pts: bool = False,
-    ) -> None:
-        self.process = process
+class SharedMemoryFrameSink:
+    def __init__(self, ring: SharedVideoRingBuffer, channel_id: int, source_id: str, *, target_pix_fmt: str | None = None) -> None:
         self.ring = ring
         self.channel_id = channel_id
         self.source_id = source_id
+        self.target_width = ring.config.frame_width
+        self.target_height = ring.config.frame_height
+        self.target_pix_fmt = target_pix_fmt or ring.config.pix_fmt
+
+    def write_frame(self, pts: int, frame_bytes: bytes, *, width: int, height: int, pix_fmt: str) -> None:
+        out_width, out_height, out_pix_fmt, out_bytes = normalize_frame_for_shared_memory(
+            frame_bytes,
+            width=width,
+            height=height,
+            pix_fmt=pix_fmt,
+            max_width=self.target_width,
+            max_height=self.target_height,
+            target_pix_fmt=self.target_pix_fmt,
+        )
+        self.ring.write_frame(
+            self.channel_id,
+            pts,
+            out_bytes,
+            width=out_width,
+            height=out_height,
+            pix_fmt=out_pix_fmt,
+            source_id=self.source_id,
+        )
+
+
+class _FfmpegDecodeWorker:
+    def __init__(self, process, sink: SharedMemoryFrameSink, *, frame_width: int, frame_height: int, pix_fmt: str, synthetic_pts: bool = False) -> None:
+        self.process = process
+        self.sink = sink
         self.frame_width = frame_width
         self.frame_height = frame_height
         self.pix_fmt = pix_fmt
@@ -60,12 +79,10 @@ class _FfmpegDecodeWorker:
             match = SHOWINFO_RE.search(text)
             if match is None:
                 continue
-            pts_value = match.group(1)
             try:
-                pts_ms = int(float(pts_value) * 1000)
+                self._stderr_pts_queue.put(int(float(match.group(1)) * 1000))
             except ValueError:
                 continue
-            self._stderr_pts_queue.put(pts_ms)
 
     def _resolve_pts(self, frame_index: int) -> int:
         if self.synthetic_pts:
@@ -81,24 +98,14 @@ class _FfmpegDecodeWorker:
         try:
             while True:
                 chunk = self.process.stdout.read(self.frame_size)
-                if not chunk:
-                    break
-                if len(chunk) != self.frame_size:
+                if not chunk or len(chunk) != self.frame_size:
                     break
                 pts = self._resolve_pts(frame_index)
-                self.ring.write_frame(
-                    self.channel_id,
-                    pts,
-                    chunk,
-                    width=self.frame_width,
-                    height=self.frame_height,
-                    pix_fmt=self.pix_fmt,
-                    source_id=self.source_id,
-                )
+                self.sink.write_frame(pts, chunk, width=self.frame_width, height=self.frame_height, pix_fmt=self.pix_fmt)
                 frame_index += 1
                 self.stats.frames_written = frame_index
                 self.stats.last_pts = pts
-        except BaseException as exc:  # pragma: no cover - only for crash visibility
+        except BaseException as exc:
             self._stdout_exc = exc
 
     def run(self, timeout: Optional[float] = None) -> DecodeStats:
@@ -117,17 +124,7 @@ class _FfmpegDecodeWorker:
 
 
 class AnnexBSharedMemoryWriter:
-    def __init__(
-        self,
-        ring: SharedVideoRingBuffer,
-        channel_id: int,
-        source_id: str,
-        *,
-        codec: str,
-        frame_width: int,
-        frame_height: int,
-        pix_fmt: str = 'nv12',
-    ) -> None:
+    def __init__(self, ring: SharedVideoRingBuffer, channel_id: int, source_id: str, *, codec: str, frame_width: int, frame_height: int, pix_fmt: str = 'nv12') -> None:
         self.ring = ring
         self.channel_id = channel_id
         self.source_id = source_id
@@ -136,23 +133,15 @@ class AnnexBSharedMemoryWriter:
         self.frame_height = frame_height
         self.pix_fmt = pix_fmt
         self.frame_size = frame_width * frame_height * 3 // 2
+        self.sink = SharedMemoryFrameSink(ring, channel_id, source_id, target_pix_fmt=pix_fmt)
         input_kwargs = {'format': 'h264' if codec == 'H264' else 'hevc'}
-        stream = ffmpeg.input('pipe:', **input_kwargs)
-        stream = stream.filter('showinfo')
-        stream = ffmpeg.output(
-            stream,
-            'pipe:',
-            format='rawvideo',
-            pix_fmt=pix_fmt,
-            s=f'{frame_width}x{frame_height}',
-            loglevel='info',
-        )
+        stream = ffmpeg.input('pipe:', **input_kwargs).filter('showinfo')
+        stream = ffmpeg.output(stream, 'pipe:', format='rawvideo', pix_fmt=pix_fmt, s=f'{frame_width}x{frame_height}', loglevel='info')
         self.process = ffmpeg.run_async(stream, pipe_stdin=True, pipe_stdout=True, pipe_stderr=True, quiet=True)
         self._pts_queue: 'queue.Queue[int]' = queue.Queue()
         self._stderr_thread = threading.Thread(target=self._stderr_loop, daemon=True)
         self._stdout_thread = threading.Thread(target=self._stdout_loop, daemon=True)
-        self._stderr_thread.start()
-        self._stdout_thread.start()
+        self._stderr_thread.start(); self._stdout_thread.start()
         self._frames_written = 0
         self._last_pts = -1
         self._closed = False
@@ -160,10 +149,8 @@ class AnnexBSharedMemoryWriter:
     def _stderr_loop(self) -> None:
         if self.process.stderr is None:
             return
-        while True:
-            line = self.process.stderr.readline()
-            if not line:
-                break
+        while self.process.stderr.readline():
+            pass
 
     def _stdout_loop(self) -> None:
         assert self.process.stdout is not None
@@ -175,15 +162,7 @@ class AnnexBSharedMemoryWriter:
                 pts = self._pts_queue.get(timeout=1.0)
             except queue.Empty:
                 pts = int(time.time() * 1000)
-            self.ring.write_frame(
-                self.channel_id,
-                pts,
-                chunk,
-                width=self.frame_width,
-                height=self.frame_height,
-                pix_fmt=self.pix_fmt,
-                source_id=self.source_id,
-            )
+            self.sink.write_frame(pts, chunk, width=self.frame_width, height=self.frame_height, pix_fmt=self.pix_fmt)
             self._frames_written += 1
             self._last_pts = pts
 
@@ -207,75 +186,76 @@ class AnnexBSharedMemoryWriter:
         return DecodeStats(frames_written=self._frames_written, last_pts=self._last_pts)
 
 
-def _build_decode_stream(input_url: str, *, pix_fmt: str, rtsp: bool = False):
-    input_kwargs = {'rtsp_transport': 'tcp'} if rtsp else {}
-    stream = ffmpeg.input(input_url, **input_kwargs)
-    stream = stream.filter('showinfo')
-    return ffmpeg.output(stream, 'pipe:', format='rawvideo', pix_fmt=pix_fmt, loglevel='info')
+def _raw_to_bgr(frame_bytes: bytes, *, width: int, height: int, pix_fmt: str) -> np.ndarray:
+    y_size = width * height
+    uv_size = y_size // 4
+    if pix_fmt == 'nv12':
+        y = np.frombuffer(frame_bytes[:y_size], dtype=np.uint8).reshape((height, width))
+        uv = np.frombuffer(frame_bytes[y_size:y_size + 2 * uv_size], dtype=np.uint8).reshape((height // 2, width // 2, 2))
+        return cv2.cvtColorTwoPlane(y, uv, cv2.COLOR_YUV2BGR_NV12)
+    if pix_fmt == 'yuv420p':
+        yuv = np.frombuffer(frame_bytes[: y_size + 2 * uv_size], dtype=np.uint8).reshape((height * 3 // 2, width))
+        return cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
+    raise ValueError(f'unsupported pix_fmt: {pix_fmt}')
 
 
-def _probe_video_shape(input_url: str) -> tuple[int, int]:
-    probe = ffmpeg.probe(input_url)
+def _bgr_to_raw_nv12(frame_bgr: np.ndarray) -> bytes:
+    height, width = frame_bgr.shape[:2]
+    i420 = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2YUV_I420).reshape(-1)
+    y_size = width * height
+    uv_plane = y_size // 4
+    y = i420[:y_size]
+    u = i420[y_size:y_size + uv_plane]
+    v = i420[y_size + uv_plane:y_size + 2 * uv_plane]
+    uv = np.empty(uv_plane * 2, dtype=np.uint8)
+    uv[0::2] = u
+    uv[1::2] = v
+    return np.concatenate([y, uv]).tobytes()
+
+
+def _bgr_to_raw_yuv420p(frame_bgr: np.ndarray) -> bytes:
+    return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2YUV_I420).reshape(-1).tobytes()
+
+
+def _fit_within(width: int, height: int, max_width: int, max_height: int) -> tuple[int, int]:
+    if width <= max_width and height <= max_height:
+        return width, height
+    scale = min(max_width / width, max_height / height)
+    return max(2, int(width * scale) // 2 * 2), max(2, int(height * scale) // 2 * 2)
+
+
+def normalize_frame_for_shared_memory(frame_bytes: bytes, *, width: int, height: int, pix_fmt: str, max_width: int, max_height: int, target_pix_fmt: str) -> tuple[int, int, str, bytes]:
+    out_width, out_height = _fit_within(width, height, max_width, max_height)
+    if (out_width, out_height) == (width, height) and pix_fmt == target_pix_fmt:
+        return width, height, pix_fmt, frame_bytes
+    frame_bgr = _raw_to_bgr(frame_bytes, width=width, height=height, pix_fmt=pix_fmt)
+    if (out_width, out_height) != (width, height):
+        frame_bgr = cv2.resize(frame_bgr, (out_width, out_height), interpolation=cv2.INTER_AREA)
+    if target_pix_fmt == 'nv12':
+        out_bytes = _bgr_to_raw_nv12(frame_bgr)
+    elif target_pix_fmt == 'yuv420p':
+        out_bytes = _bgr_to_raw_yuv420p(frame_bgr)
+    else:
+        raise ValueError(f'unsupported target_pix_fmt: {target_pix_fmt}')
+    return out_width, out_height, target_pix_fmt, out_bytes
+
+
+def _build_decode_stream(input_path: str, *, pix_fmt: str):
+    return ffmpeg.output(ffmpeg.input(input_path).filter('showinfo'), 'pipe:', format='rawvideo', pix_fmt=pix_fmt, loglevel='info')
+
+
+def _probe_video_shape(input_path: str) -> tuple[int, int]:
+    probe = ffmpeg.probe(input_path)
     streams = [stream for stream in probe['streams'] if stream.get('codec_type') == 'video']
     if not streams:
-        raise RuntimeError(f'no video stream found in {input_url!r}')
+        raise RuntimeError(f'no video stream found in {input_path!r}')
     stream = streams[0]
     return int(stream['width']), int(stream['height'])
 
 
-def decode_video_file_to_shm(
-    input_path: str | Path,
-    ring: SharedVideoRingBuffer,
-    channel_id: int,
-    source_id: str,
-    *,
-    pix_fmt: str = 'nv12',
-    timeout: float | None = 20,
-) -> DecodeStats:
+def decode_video_file_to_shm(input_path: str | Path, ring: SharedVideoRingBuffer, channel_id: int, source_id: str, *, pix_fmt: str = 'nv12', timeout: float | None = 20) -> DecodeStats:
     input_path = str(input_path)
     width, height = _probe_video_shape(input_path)
-    process = ffmpeg.run_async(
-        _build_decode_stream(input_path, pix_fmt=pix_fmt),
-        pipe_stdout=True,
-        pipe_stderr=True,
-        quiet=True,
-    )
-    worker = _FfmpegDecodeWorker(
-        process=process,
-        ring=ring,
-        channel_id=channel_id,
-        source_id=source_id,
-        frame_width=width,
-        frame_height=height,
-        pix_fmt=pix_fmt,
-    )
-    return worker.run(timeout=timeout)
-
-
-def decode_rtsp_to_shm(
-    rtsp_url: str,
-    ring: SharedVideoRingBuffer,
-    channel_id: int,
-    source_id: str,
-    *,
-    pix_fmt: str = 'nv12',
-    timeout: float | None = None,
-) -> DecodeStats:
-    width, height = _probe_video_shape(rtsp_url)
-    process = ffmpeg.run_async(
-        _build_decode_stream(rtsp_url, pix_fmt=pix_fmt, rtsp=True),
-        pipe_stdout=True,
-        pipe_stderr=True,
-        quiet=True,
-    )
-    worker = _FfmpegDecodeWorker(
-        process=process,
-        ring=ring,
-        channel_id=channel_id,
-        source_id=source_id,
-        frame_width=width,
-        frame_height=height,
-        pix_fmt=pix_fmt,
-        synthetic_pts=True,
-    )
+    process = ffmpeg.run_async(_build_decode_stream(input_path, pix_fmt=pix_fmt), pipe_stdout=True, pipe_stderr=True, quiet=True)
+    worker = _FfmpegDecodeWorker(process=process, sink=SharedMemoryFrameSink(ring, channel_id, source_id, target_pix_fmt=ring.config.pix_fmt), frame_width=width, frame_height=height, pix_fmt=pix_fmt)
     return worker.run(timeout=timeout)
